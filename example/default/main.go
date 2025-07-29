@@ -39,7 +39,7 @@ func main() {
 	ipResults := checker.CheckIPs(ips)
 	fmt.Println("批量IP检查结果:")
 	for _, result := range ipResults {
-		fmt.Printf("IP: %s, CDN: %v, 提供商: %s, 原因: %s\n", 
+		fmt.Printf("IP: %s, CDN: %v, 提供商: %s, 原因: %s\n",
 			result.IP, result.IsCDN, result.Provider, result.Reason)
 	}
 	fmt.Println()
@@ -47,7 +47,7 @@ func main() {
 	// 批量检查域名
 	domains := []string{"google.com", "cloudflare.com", "example.com", "qq.com", "baidu.com"}
 	results, errors := checker.CheckDomains(domains)
-	
+
 	if len(errors) > 0 {
 		fmt.Println("检查过程中的错误:")
 		for _, err := range errors {
@@ -55,13 +55,13 @@ func main() {
 		}
 		fmt.Println()
 	}
-	
+
 	fmt.Println("批量域名检查结果:")
 	for _, result := range results {
-		fmt.Printf("域名: %s, IP: %s, CDN: %v, 提供商: %s\n", 
-			result.Domain, 
-			cdncheck.IPsToString(result.IPs, " | "), 
-			result.IsCDN, 
+		fmt.Printf("域名: %s, IP: %s, CDN: %v, 提供商: %s\n",
+			result.Domain,
+			cdncheck.IPsToString(result.IPs, " | "),
+			result.IsCDN,
 			result.Provider)
 	}
 	fmt.Println()
@@ -85,12 +85,12 @@ func main() {
 	// 演示带上下文的检查
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	
+
 	result, err = customChecker.CheckDomainWithContext(ctx, "github.com")
 	if err != nil {
 		log.Printf("带上下文检查失败: %v", err)
 	} else {
-		fmt.Printf("带上下文检查 - 域名: %s, CDN: %v, 提供商: %s\n", 
+		fmt.Printf("带上下文检查 - 域名: %s, CDN: %v, 提供商: %s\n",
 			result.Domain, result.IsCDN, result.Provider)
 	}
 	fmt.Println()
