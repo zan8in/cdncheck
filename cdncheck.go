@@ -2,13 +2,20 @@ package cdncheck
 
 import (
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 // CDNChecker CDN检测器
@@ -19,10 +26,19 @@ type CDNChecker struct {
 	cacheOnce sync.Once
 }
 
+// ProxyConfig 代理配置
+type ProxyConfig struct {
+	Type     string        `json:"type"`     // "http", "socks5", "doh"
+	URL      string        `json:"url"`      // 代理服务器URL
+	Username string        `json:"username"` // 认证用户名（可选）
+	Password string        `json:"password"` // 认证密码（可选）
+	Timeout  time.Duration `json:"timeout"`  // 代理连接超时
+}
+
 // Config CDN检测配置
 type Config struct {
 	// DNS配置
-	DNSServers    []string      // DNS服务器列表
+	DNSServers    []string      // 传统DNS服务器列表
 	DNSTimeout    time.Duration // DNS查询超时时间
 	RetryCount    int           // 重试次数
 	RetryInterval time.Duration // 重试间隔
@@ -32,6 +48,17 @@ type Config struct {
 	EnableMultipleDNS bool // 是否启用多DNS服务器查询
 	Concurrency       int  // 并发数
 
+	// DoH配置（推荐）
+	EnableDoH  bool     `json:"enable_doh"`  // 是否启用DNS-over-HTTPS
+	DoHServers []string `json:"doh_servers"` // DoH服务器列表
+
+	// 代理配置
+	EnableProxy bool        `json:"enable_proxy"` // 是否启用代理
+	Proxy       ProxyConfig `json:"proxy"`        // 代理配置
+
+	// 兼容性字段（已弃用，保持向后兼容）
+	ProxyURL string `json:"proxy_url,omitempty"` // 已弃用，使用Proxy.URL
+
 	// 自定义CDN提供商
 	CustomProviders map[string][]string
 }
@@ -39,19 +66,38 @@ type Config struct {
 // DefaultConfig 默认配置
 func DefaultConfig() *Config {
 	return &Config{
+		// 传统DNS服务器（作为回退）
 		DNSServers: []string{
 			"8.8.8.8:53",         // Google DNS
 			"1.1.1.1:53",         // Cloudflare DNS
 			"114.114.114.114:53", // 114 DNS
 			"223.5.5.5:53",       // 阿里DNS
 		},
-		DNSTimeout:        3 * time.Second,
+		DNSTimeout:        5 * time.Second,
 		RetryCount:        3,
-		RetryInterval:     50 * time.Millisecond,
+		RetryInterval:     100 * time.Millisecond,
 		EnableMultiIP:     true,
 		EnableMultipleDNS: true,
 		Concurrency:       10,
-		CustomProviders:   make(map[string][]string),
+
+		// 默认启用DoH（推荐）
+		EnableDoH: true,
+		DoHServers: []string{
+			"https://1.1.1.1/dns-query",        // Cloudflare DoH
+			"https://8.8.8.8/resolve",          // Google DoH
+			"https://dns.alidns.com/dns-query", // 阿里DoH
+			"https://doh.pub/dns-query",        // 腾讯DoH
+		},
+
+		// 代理配置
+		EnableProxy: false,
+		Proxy: ProxyConfig{
+			Type:    "http",
+			URL:     "",
+			Timeout: 10 * time.Second,
+		},
+
+		CustomProviders: make(map[string][]string),
 	}
 }
 
@@ -66,12 +112,46 @@ func (c *Config) Validate() error {
 	if c.Concurrency <= 0 {
 		return fmt.Errorf("并发数必须大于0")
 	}
-	// 验证DNS服务器格式
+
+	// 验证传统DNS服务器格式
 	for _, server := range c.DNSServers {
 		if _, _, err := net.SplitHostPort(server); err != nil {
 			return fmt.Errorf("无效的DNS服务器格式: %s", server)
 		}
 	}
+
+	// 验证DoH服务器格式
+	if c.EnableDoH {
+		for _, server := range c.DoHServers {
+			if _, err := url.Parse(server); err != nil {
+				return fmt.Errorf("无效的DoH服务器格式: %s", server)
+			}
+		}
+	}
+
+	// 验证代理配置
+	if c.EnableProxy {
+		if c.Proxy.URL == "" {
+			return fmt.Errorf("启用代理时必须提供代理URL")
+		}
+		if _, err := url.Parse(c.Proxy.URL); err != nil {
+			return fmt.Errorf("无效的代理URL格式: %s", c.Proxy.URL)
+		}
+		if c.Proxy.Type != "http" && c.Proxy.Type != "socks5" {
+			return fmt.Errorf("不支持的代理类型: %s，仅支持 http 和 socks5", c.Proxy.Type)
+		}
+	}
+
+	// 向后兼容性处理
+	if c.ProxyURL != "" && c.Proxy.URL == "" {
+		c.Proxy.URL = c.ProxyURL
+		if strings.HasPrefix(c.ProxyURL, "socks5://") {
+			c.Proxy.Type = "socks5"
+		} else {
+			c.Proxy.Type = "http"
+		}
+	}
+
 	return nil
 }
 
@@ -397,15 +477,36 @@ func (c *CDNChecker) resolveIPs(domain string) ([]string, error) {
 	return c.resolveIPsWithContext(context.Background(), domain)
 }
 
-// resolveIPsWithContext 带上下文的DNS解析
+// resolveIPsWithContext 智能DNS解析（优先级：DoH > 代理DNS > 传统DNS）
 func (c *CDNChecker) resolveIPsWithContext(ctx context.Context, domain string) ([]string, error) {
-	if c.config.EnableMultipleDNS {
-		return c.resolveWithMultipleDNS(ctx, domain)
+	c.mu.RLock()
+	enableDoH := c.config.EnableDoH
+	enableProxy := c.config.EnableProxy
+	c.mu.RUnlock()
+
+	// 优先使用DoH
+	if enableDoH {
+		if ips, err := c.resolveWithDoH(ctx, domain); err == nil && len(ips) > 0 {
+			return ips, nil
+		}
 	}
-	return c.resolveWithRetry(ctx, domain)
+
+	// 如果DoH失败，尝试代理DNS
+	if enableProxy {
+		if ips, err := c.resolveWithProxy(ctx, domain); err == nil && len(ips) > 0 {
+			var ipStrings []string
+			for _, ip := range ips {
+				ipStrings = append(ipStrings, ip.String())
+			}
+			return ipStrings, nil
+		}
+	}
+
+	// 最后回退到传统DNS
+	return c.resolveWithMultipleDNS(ctx, domain)
 }
 
-// resolveWithRetry 带重试的DNS解析
+// resolveWithRetry 带重试的DNS解析（支持代理）
 func (c *CDNChecker) resolveWithRetry(ctx context.Context, domain string) ([]string, error) {
 	allIPs := make(map[string]bool)
 
@@ -416,7 +517,16 @@ func (c *CDNChecker) resolveWithRetry(ctx context.Context, domain string) ([]str
 		default:
 		}
 
-		ips, err := net.LookupIP(domain)
+		var ips []net.IP
+		var err error
+
+		// 如果启用代理，使用自定义解析器
+		if c.config.EnableProxy {
+			ips, err = c.resolveWithProxy(ctx, domain)
+		} else {
+			ips, err = net.LookupIP(domain)
+		}
+
 		if err != nil {
 			if i == c.config.RetryCount-1 {
 				return nil, err
@@ -442,24 +552,66 @@ func (c *CDNChecker) resolveWithRetry(ctx context.Context, domain string) ([]str
 	return result, nil
 }
 
-// resolveWithMultipleDNS 使用多个DNS服务器解析
+// resolveWithProxy 通过代理进行DNS解析
+func (c *CDNChecker) resolveWithProxy(ctx context.Context, domain string) ([]net.IP, error) {
+	// 创建支持代理的拨号器
+	dialer, err := c.createDialer()
+	if err != nil {
+		return nil, err
+	}
+
+	// 使用第一个DNS服务器进行解析
+	dnsServer := c.config.DNSServers[0]
+	if dnsServer == "" {
+		dnsServer = "8.8.8.8:53"
+	}
+
+	r := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return dialer.Dial(network, dnsServer)
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, c.config.DNSTimeout)
+	defer cancel()
+
+	ipAddrs, err := r.LookupIPAddr(ctx, domain)
+	if err != nil {
+		return nil, err
+	}
+
+	var ips []net.IP
+	for _, ipAddr := range ipAddrs {
+		ips = append(ips, ipAddr.IP)
+	}
+
+	return ips, nil
+}
+
+// resolveWithMultipleDNS 使用多个DNS服务器解析（支持代理）
 func (c *CDNChecker) resolveWithMultipleDNS(ctx context.Context, domain string) ([]string, error) {
 	allIPs := make(map[string]bool)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
+	var hasSuccess bool
 
 	for _, dnsServer := range c.config.DNSServers {
 		wg.Add(1)
 		go func(server string) {
 			defer wg.Done()
 
+			// 创建支持代理的拨号器
+			dialer, err := c.createDialer()
+			if err != nil {
+				return
+			}
+
 			r := &net.Resolver{
 				PreferGo: true,
 				Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-					d := net.Dialer{
-						Timeout: c.config.DNSTimeout,
-					}
-					return d.DialContext(ctx, network, server)
+					// 使用代理拨号器连接DNS服务器
+					return dialer.Dial(network, server)
 				},
 			}
 
@@ -467,8 +619,9 @@ func (c *CDNChecker) resolveWithMultipleDNS(ctx context.Context, domain string) 
 			defer cancel()
 
 			ips, err := r.LookupIPAddr(ctx, domain)
-			if err == nil {
+			if err == nil && len(ips) > 0 {
 				mu.Lock()
+				hasSuccess = true
 				for _, ip := range ips {
 					allIPs[ip.IP.String()] = true
 				}
@@ -479,7 +632,7 @@ func (c *CDNChecker) resolveWithMultipleDNS(ctx context.Context, domain string) 
 
 	wg.Wait()
 
-	if len(allIPs) == 0 {
+	if !hasSuccess || len(allIPs) == 0 {
 		return nil, fmt.Errorf("所有DNS服务器都无法解析域名")
 	}
 
@@ -599,7 +752,7 @@ func IPsToStringWithFormat(ips []string, format string, customSep ...string) str
 	case "json":
 		// 使用strings.Builder优化性能
 		var builder strings.Builder
-		builder.WriteString(`["`) 
+		builder.WriteString(`["`)
 		builder.WriteString(strings.Join(ips, `","`))
 		builder.WriteString(`"]`)
 		return builder.String()
@@ -611,4 +764,211 @@ func IPsToStringWithFormat(ips []string, format string, customSep ...string) str
 	default:
 		return strings.Join(ips, ",")
 	}
+}
+
+// createDialer 创建拨号器（支持代理）
+func (c *CDNChecker) createDialer() (proxy.Dialer, error) {
+	if !c.config.EnableProxy || c.config.ProxyURL == "" {
+		// 返回直连拨号器
+		return &net.Dialer{
+			Timeout: c.config.DNSTimeout,
+		}, nil
+	}
+
+	proxyURL, err := url.Parse(c.config.ProxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("解析代理URL失败: %w", err)
+	}
+
+	switch proxyURL.Scheme {
+	case "socks5":
+		// 创建SOCKS5代理拨号器
+		dialer, err := proxy.SOCKS5("tcp", proxyURL.Host, nil, &net.Dialer{
+			Timeout: c.config.DNSTimeout,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("创建SOCKS5代理失败: %w", err)
+		}
+		return dialer, nil
+	case "http", "https":
+		// HTTP代理支持（可选）
+		return nil, fmt.Errorf("暂不支持HTTP代理")
+	default:
+		return nil, fmt.Errorf("不支持的代理类型: %s", proxyURL.Scheme)
+	}
+}
+
+// SetProxy 设置代理（支持HTTP和SOCKS5）
+func (c *CDNChecker) SetProxy(proxyType, proxyURL string, auth ...string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, err := url.Parse(proxyURL); err != nil {
+		return fmt.Errorf("无效的代理URL: %w", err)
+	}
+
+	if proxyType != "http" && proxyType != "socks5" {
+		return fmt.Errorf("不支持的代理类型: %s", proxyType)
+	}
+
+	c.config.EnableProxy = true
+	c.config.Proxy.Type = proxyType
+	c.config.Proxy.URL = proxyURL
+
+	// 设置认证信息
+	if len(auth) >= 2 {
+		c.config.Proxy.Username = auth[0]
+		c.config.Proxy.Password = auth[1]
+	}
+
+	return nil
+}
+
+// DisableProxy 禁用代理
+func (c *CDNChecker) DisableProxy() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.config.EnableProxy = false
+}
+
+// SetHTTPProxy 设置HTTP代理（便捷方法）
+func (c *CDNChecker) SetHTTPProxy(proxyURL string, auth ...string) error {
+	return c.SetProxy("http", proxyURL, auth...)
+}
+
+// SetSOCKS5Proxy 设置SOCKS5代理（便捷方法）
+func (c *CDNChecker) SetSOCKS5Proxy(proxyURL string, auth ...string) error {
+	return c.SetProxy("socks5", proxyURL, auth...)
+}
+
+// EnableDoH 启用DoH
+func (c *CDNChecker) EnableDoH(dohServers ...string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.config.EnableDoH = true
+	if len(dohServers) > 0 {
+		c.config.DoHServers = dohServers
+	}
+}
+
+// DisableDoH 禁用DoH
+func (c *CDNChecker) DisableDoH() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.config.EnableDoH = false
+}
+
+// GetProxyStatus 获取代理状态
+func (c *CDNChecker) GetProxyStatus() (bool, string, string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.config.EnableProxy, c.config.Proxy.Type, c.config.Proxy.URL
+}
+
+// DoHQuery DoH查询请求结构
+type DoHQuery struct {
+	Name string `json:"name"`
+	Type int    `json:"type"` // 1 for A record, 28 for AAAA
+}
+
+// DoHResponse DoH查询响应结构
+type DoHResponse struct {
+	Status int `json:"Status"`
+	Answer []struct {
+		Name string `json:"name"`
+		Type int    `json:"type"`
+		Data string `json:"data"`
+	} `json:"Answer"`
+}
+
+// resolveWithDoH 使用DNS-over-HTTPS解析域名
+func (c *CDNChecker) resolveWithDoH(ctx context.Context, domain string) ([]string, error) {
+	c.mu.RLock()
+	dohServers := make([]string, len(c.config.DoHServers))
+	copy(dohServers, c.config.DoHServers)
+	enableProxy := c.config.EnableProxy
+	proxyConfig := c.config.Proxy
+	c.mu.RUnlock()
+
+	// 创建HTTP客户端
+	client := &http.Client{
+		Timeout: c.config.DNSTimeout,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
+		},
+	}
+
+	// 如果启用代理且为HTTP代理，配置代理
+	if enableProxy && proxyConfig.Type == "http" && proxyConfig.URL != "" {
+		proxyURL, err := url.Parse(proxyConfig.URL)
+		if err == nil {
+			// 设置认证信息
+			if proxyConfig.Username != "" {
+				proxyURL.User = url.UserPassword(proxyConfig.Username, proxyConfig.Password)
+			}
+			client.Transport.(*http.Transport).Proxy = http.ProxyURL(proxyURL)
+		}
+	}
+
+	// 尝试每个DoH服务器
+	for _, dohServer := range dohServers {
+		ips, err := c.queryDoH(ctx, client, dohServer, domain)
+		if err == nil && len(ips) > 0 {
+			return ips, nil
+		}
+	}
+
+	return nil, fmt.Errorf("所有DoH服务器查询失败")
+}
+
+// queryDoH 查询单个DoH服务器
+func (c *CDNChecker) queryDoH(ctx context.Context, client *http.Client, dohServer, domain string) ([]string, error) {
+	// 构造查询URL
+	queryURL := fmt.Sprintf("%s?name=%s&type=A", dohServer, domain)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", queryURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// 设置DoH请求头
+	req.Header.Set("Accept", "application/dns-json")
+	req.Header.Set("User-Agent", "cdncheck/2.0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("DoH查询失败，状态码: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var dohResp DoHResponse
+	if err := json.Unmarshal(body, &dohResp); err != nil {
+		return nil, err
+	}
+
+	if dohResp.Status != 0 {
+		return nil, fmt.Errorf("DoH查询返回错误状态: %d", dohResp.Status)
+	}
+
+	var ips []string
+	for _, answer := range dohResp.Answer {
+		if answer.Type == 1 { // A记录
+			ips = append(ips, answer.Data)
+		}
+	}
+
+	return ips, nil
 }
