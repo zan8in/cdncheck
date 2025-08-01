@@ -288,7 +288,7 @@ func (c *CDNChecker) validateCDN(ips []string) (bool, string) {
 
 	// 基于其他特征判断
 	if hasMultipleIPs && hasGeoDistribution {
-		return true, "Unknown CDN"
+		return true, ""
 	}
 
 	return false, ""

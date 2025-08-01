@@ -27,7 +27,7 @@ func basicExample() {
 	checker := cdncheck.NewDefault()
 
 	// 检测域名
-	domains := []string{"www.baidu.com", "github.com", "example.com", "deepseek.com", "qq.com"}
+	domains := []string{"www.baidu.com", "github.com", "example.com", "deepseek.com", "qq.com", "x.com"}
 	for _, domain := range domains {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
