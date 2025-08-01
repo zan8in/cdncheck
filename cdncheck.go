@@ -30,37 +30,46 @@ type CheckResult struct {
 
 var CDNProviders = map[string][]string{
 	"Cloudflare": {
+		// IPv4段
 		"103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
 		"104.16.0.0/12", "108.162.192.0/18", "131.0.72.0/22",
 		"141.101.64.0/18", "162.158.0.0/15", "172.64.0.0/13",
 		"173.245.48.0/20", "188.114.96.0/20", "190.93.240.0/20",
 		"197.234.240.0/22", "198.41.128.0/17",
-		// 可能的新范围（需验证）
-		"104.18.0.0/16", "104.19.0.0/16", // 扩展子网
+		"104.18.0.0/16", "104.19.0.0/16",
+		// IPv6段
+		"2400:cb00::/32", "2606:4700::/32", "2803:f800::/32",
+		"2405:b500::/32", "2405:8100::/32", "2c0f:f248::/32",
 	},
 	"Akamai": {
+		// IPv4段
 		"23.32.0.0/11", "104.64.0.0/10", "184.24.0.0/13",
 		"184.50.0.0/15", "184.84.0.0/14", "2.16.0.0/13",
 		"95.100.0.0/15", "23.0.0.0/12", "96.16.0.0/15",
 		"72.246.0.0/15",
-		// 可能的新范围（需验证）
-		"2600:1400::/28", // IPv6支持
+		// IPv6段
+		"2600:1400::/28", "2a02:26f0::/32",
 	},
 	"Amazon CloudFront": {
+		// IPv4段
 		"54.182.0.0/16", "54.192.0.0/16", "54.230.0.0/16",
 		"54.239.128.0/18", "54.239.192.0/19", "99.84.0.0/16",
 		"205.251.192.0/19", "52.124.128.0/17", "13.32.0.0/15",
 		"13.224.0.0/14", "13.35.0.0/16",
-		// 可能的新范围（基于2025年7月更新）
-		"18.160.0.0/14", "65.9.128.0/18", // 扩展范围
+		"18.160.0.0/14", "65.9.128.0/18",
+		// IPv6段
+		"2600:9000::/28",
 	},
 	"Fastly": {
+		// IPv4段
 		"23.235.32.0/20", "43.249.72.0/22", "103.244.50.0/24",
 		"146.75.0.0/16", "151.101.0.0/16", "157.52.64.0/18",
 		"167.82.0.0/17", "185.31.16.0/22", "199.27.72.0/21",
-		"199.232.0.0/16",
-		// 可能的新范围（需验证）
-		"159.65.0.0/16", // 扩展子网
+		"199.232.0.0/16", "159.65.0.0/16",
+		// GitHub相关IP段（Fastly提供CDN服务）
+		"20.205.0.0/16", "140.82.0.0/16",
+		// IPv6段
+		"2a04:4e40::/32", "2a04:4e42::/32",
 	},
 }
 
@@ -147,17 +156,46 @@ func (c *CDNChecker) CheckDomain(ctx context.Context, domain string) (*CheckResu
 		Timestamp: time.Now(),
 	}
 
-	// 使用godns进行多服务器并发查询
-	dnsResult, err := c.dnsClient.MultiQueryA(ctx, domain)
-	if err != nil {
-		result.Reason = "DNS查询失败: " + err.Error()
-		return result, err
+	// 并发查询IPv4和IPv6
+	var ipv4IPs, ipv6IPs []string
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	wg.Add(2)
+
+	// 查询A记录（IPv4）
+	go func() {
+		defer wg.Done()
+		if dnsResult, err := c.dnsClient.MultiQueryA(ctx, domain); err == nil {
+			mu.Lock()
+			ipv4IPs = dnsResult.AllIPs
+			mu.Unlock()
+		}
+	}()
+
+	// 查询AAAA记录（IPv6）
+	go func() {
+		defer wg.Done()
+		if dnsResult, err := c.dnsClient.MultiQueryAAAA(ctx, domain); err == nil {
+			mu.Lock()
+			ipv6IPs = dnsResult.AllIPs
+			mu.Unlock()
+		}
+	}()
+
+	wg.Wait()
+
+	// 合并IPv4和IPv6地址
+	allIPs := append(ipv4IPs, ipv6IPs...)
+	if len(allIPs) == 0 {
+		result.Reason = "DNS查询无结果"
+		return result, nil
 	}
 
-	result.IPs = dnsResult.AllIPs
+	result.IPs = allIPs
 
 	// 多重验证策略
-	isCDN, provider := c.validateCDN(dnsResult.AllIPs, domain)
+	isCDN, provider := c.validateCDN(allIPs)
 	result.IsCDN = isCDN
 	result.Provider = provider
 
@@ -203,7 +241,7 @@ func (c *CDNChecker) CheckIP(ip string) (*CheckResult, error) {
 }
 
 // validateCDN 多重验证CDN（避免误报和漏报）
-func (c *CDNChecker) validateCDN(ips []string, domain string) (bool, string) {
+func (c *CDNChecker) validateCDN(ips []string) (bool, string) {
 	if len(ips) == 0 {
 		return false, ""
 	}
@@ -258,25 +296,33 @@ func (c *CDNChecker) validateCDN(ips []string, domain string) (bool, string) {
 
 // checkGeoDistribution 检查IP地理分布（简化实现）
 func (c *CDNChecker) checkGeoDistribution(ips []string) bool {
-	// 简化的地理分布检测：检查IP段的多样性
 	if len(ips) < 2 {
 		return false
 	}
 
-	subnets := make(map[string]bool)
+	ipv4Subnets := make(map[string]bool)
+	ipv6Subnets := make(map[string]bool)
+
 	for _, ip := range ips {
 		parsedIP := net.ParseIP(ip)
-		if parsedIP != nil {
-			// 提取/16网段作为地理区域的粗略指标
-			if ipv4 := parsedIP.To4(); ipv4 != nil {
-				subnet := fmt.Sprintf("%d.%d", ipv4[0], ipv4[1])
-				subnets[subnet] = true
-			}
+		if parsedIP == nil {
+			continue
+		}
+
+		if ipv4 := parsedIP.To4(); ipv4 != nil {
+			// IPv4地理分布检测（/16网段）
+			subnet := fmt.Sprintf("%d.%d", ipv4[0], ipv4[1])
+			ipv4Subnets[subnet] = true
+		} else {
+			// IPv6地理分布检测（前32位）
+			ipv6 := parsedIP.To16()
+			subnet := fmt.Sprintf("%02x%02x:%02x%02x", ipv6[0], ipv6[1], ipv6[2], ipv6[3])
+			ipv6Subnets[subnet] = true
 		}
 	}
 
-	// 如果有多个不同的/16网段，可能是CDN
-	return len(subnets) > 1
+	// 如果IPv4或IPv6有多个不同网段，认为有地理分布
+	return len(ipv4Subnets) > 1 || len(ipv6Subnets) > 1
 }
 
 // AddCustomProvider 添加自定义CDN服务商
