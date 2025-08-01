@@ -23,6 +23,8 @@ func socks5Example() {
 	// 创建SOCKS5代理检测器
 	checker := cdncheck.New(
 		cdncheck.WithSOCKS5Proxy("127.0.0.1:20170", nil),
+		cdncheck.WithTimeout(3*time.Second),
+		cdncheck.WithRetries(1),
 	)
 
 	testDomains(checker)
@@ -34,6 +36,8 @@ func httpProxyExample() {
 	// 创建HTTP代理检测器，强制使用DoH协议
 	checker := cdncheck.New(
 		cdncheck.WithHTTPProxy("127.0.0.1:20170", nil),
+		cdncheck.WithTimeout(3*time.Second),
+		cdncheck.WithRetries(1),
 	)
 
 	testDomains(checker)
@@ -43,7 +47,7 @@ func testDomains(checker *cdncheck.CDNChecker) {
 	// 检测域名
 	domains := []string{"www.baidu.com", "github.com", "example.com", "deepseek.com", "qq.com", "x.com"}
 	for _, domain := range domains {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 
 		result, err := checker.CheckDomain(ctx, domain)

@@ -8,6 +8,7 @@
 - 🌐 **IPv6支持**: 同时检测IPv4和IPv6地址
 - 🔍 **多重验证**: IP段匹配、多IP检测、地理分布分析
 - 📡 **多协议支持**: UDP、DoH、DoT、SOCKS5/HTTP代理
+- ⚙️ **灵活配置**: 支持动态配置超时时间和重试次数
 - 🎯 **准确检测**: 内置主流CDN服务商IP段
 - 💡 **简洁设计**: 遵循"less is more"原则
 
@@ -77,18 +78,35 @@ checker := cdncheck.New(
     cdncheck.WithSOCKS5Proxy("127.0.0.1:1080", nil),
 )
 
-// 使用HTTP代理（强制DoH协议）
+// 使用HTTP代理（强制DoT协议）
 checker := cdncheck.New(
-    cdncheck.WithHTTPProxy("127.0.0.1:8080", nil),
+    cdncheck.WithHTTPProxy("http://127.0.0.1:8080", nil),
 )
 
-// 使用带认证的HTTP代理
+// 自定义超时和重试配置
+checker := cdncheck.New(
+    cdncheck.WithTimeout(30*time.Second),  // 自定义超时时间
+    cdncheck.WithRetries(5),               // 自定义重试次数
+    cdncheck.WithDoH(),                    // 使用DoH协议
+)
+
+// 组合配置示例
+checker := cdncheck.New(
+    cdncheck.WithHTTPProxy("http://proxy:8080", nil),
+    cdncheck.WithTimeout(20*time.Second),  // HTTP代理使用更长超时
+    cdncheck.WithRetries(3),               // 增加重试次数
+    cdncheck.WithDNSServers("8.8.8.8:53"), // 自定义DNS服务器
+)
+
+// 带认证的HTTP代理
 auth := &godns.ProxyAuth{
     Username: "user",
     Password: "pass",
 }
 checker := cdncheck.New(
-    cdncheck.WithHTTPProxy("127.0.0.1:8080", auth),
+    cdncheck.WithHTTPProxy("http://127.0.0.1:8080", auth),
+    cdncheck.WithTimeout(25*time.Second),
+    cdncheck.WithRetries(4),
 )
 ```
 
@@ -153,6 +171,48 @@ type CheckResult struct {
 - `WithDoH()`: 启用DNS over HTTPS
 - `WithSOCKS5Proxy(addr string, auth *godns.ProxyAuth)`: 设置SOCKS5代理
 - `WithHTTPProxy(proxyURL string, auth *godns.ProxyAuth)`: 设置HTTP代理（强制使用DoT协议）
+- `WithTimeout(timeout time.Duration)`: 设置DNS查询超时时间（默认5秒）
+- `WithRetries(retries int)`: 设置DNS查询重试次数（默认2次）
+
+## 配置说明
+
+### 超时时间建议
+
+- **UDP协议**: 5-10秒（默认5秒）
+- **DoH协议**: 10-15秒（HTTPS握手需要更多时间）
+- **代理模式**: 15-30秒（代理连接可能较慢）
+- **网络较差环境**: 20-60秒
+
+### 重试次数建议
+
+- **稳定网络**: 1-2次（默认2次）
+- **不稳定网络**: 3-5次
+- **代理环境**: 2-4次
+- **生产环境**: 建议不超过3次（避免过长等待）
+
+### 配置组合示例
+
+```go
+// 快速检测（适合批量处理）
+fastChecker := cdncheck.New(
+    cdncheck.WithTimeout(3*time.Second),
+    cdncheck.WithRetries(1),
+)
+
+// 稳定检测（适合重要查询）
+stableChecker := cdncheck.New(
+    cdncheck.WithTimeout(15*time.Second),
+    cdncheck.WithRetries(3),
+    cdncheck.WithDoH(),
+)
+
+// 代理环境（适合受限网络）
+proxyChecker := cdncheck.New(
+    cdncheck.WithHTTPProxy("http://proxy:8080", nil),
+    cdncheck.WithTimeout(30*time.Second),
+    cdncheck.WithRetries(4),
+)
+```
 
 ## 检测策略
 

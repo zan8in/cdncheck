@@ -10,14 +10,6 @@ import (
 	"github.com/zan8in/godns"
 )
 
-// CDNChecker 简洁的CDN检测器
-type CDNChecker struct {
-	dnsClient *godns.Client
-	cidrCache map[string][]*net.IPNet
-	mu        sync.RWMutex
-	cacheOnce sync.Once
-}
-
 // CheckResult CDN检测结果
 type CheckResult struct {
 	Target    string    `json:"target"`    // 域名或IP
@@ -73,26 +65,120 @@ var CDNProviders = map[string][]string{
 	},
 }
 
-// New 创建CDN检测器
+// 添加配置结构体
+type Config struct {
+	timeout  time.Duration
+	retries  int
+	servers  []string
+	protocol godns.Protocol
+	proxy    *ProxyConfig
+}
+
+type ProxyConfig struct {
+	type_ string // "socks5" or "http"
+	addr  string
+	auth  *godns.ProxyAuth
+}
+
+// 修改CDNChecker结构
+type CDNChecker struct {
+	dnsClient *godns.Client
+	cidrCache map[string][]*net.IPNet
+	mu        sync.RWMutex
+	cacheOnce sync.Once
+	config    *Config // 添加配置
+}
+
+// 新的配置选项
+func WithTimeout(timeout time.Duration) Option {
+	return func(c *CDNChecker) {
+		c.config.timeout = timeout
+	}
+}
+
+func WithRetries(retries int) Option {
+	return func(c *CDNChecker) {
+		c.config.retries = retries
+	}
+}
+
+func WithDNSServers(servers ...string) Option {
+	return func(c *CDNChecker) {
+		c.config.servers = servers
+	}
+}
+
+func WithDoH() Option {
+	return func(c *CDNChecker) {
+		c.config.protocol = godns.DoH
+	}
+}
+
+func WithSOCKS5Proxy(addr string, auth *godns.ProxyAuth) Option {
+	return func(c *CDNChecker) {
+		c.config.proxy = &ProxyConfig{
+			type_: "socks5",
+			addr:  addr,
+			auth:  auth,
+		}
+	}
+}
+
+func WithHTTPProxy(proxyURL string, auth *godns.ProxyAuth) Option {
+	return func(c *CDNChecker) {
+		c.config.proxy = &ProxyConfig{
+			type_: "http",
+			addr:  proxyURL,
+			auth:  auth,
+		}
+		c.config.protocol = godns.DoH // HTTP代理强制DoH
+	}
+}
+
+// 修改New函数
 func New(options ...Option) *CDNChecker {
 	c := &CDNChecker{
 		cidrCache: make(map[string][]*net.IPNet),
+		config: &Config{
+			timeout:  5 * time.Second, // 默认值
+			retries:  2,               // 默认值
+			protocol: godns.UDP,       // 默认协议
+		},
 	}
 
-	// 默认配置：使用多协议DNS查询
-	c.dnsClient = godns.New(
-		godns.WithProtocol(godns.UDP),
-		godns.WithTimeout(5*time.Second),
-		godns.WithRetries(2),
-	)
-
-	// 应用自定义选项
+	// 应用所有选项
 	for _, opt := range options {
 		opt(c)
 	}
 
+	// 根据最终配置创建DNS客户端
+	c.buildDNSClient()
 	c.initCIDRCache()
 	return c
+}
+
+// 新增构建DNS客户端的方法
+func (c *CDNChecker) buildDNSClient() {
+	opts := []godns.Option{
+		godns.WithProtocol(c.config.protocol),
+		godns.WithTimeout(c.config.timeout),
+		godns.WithRetries(c.config.retries),
+	}
+
+	if len(c.config.servers) > 0 {
+		opts = append(opts, godns.WithServers(c.config.servers...))
+	}
+
+	if c.config.proxy != nil {
+		switch c.config.proxy.type_ {
+		case "socks5":
+			opts = append(opts, godns.WithSOCKS5Proxy(c.config.proxy.addr, c.config.proxy.auth))
+		case "http":
+			opts = append(opts, godns.WithHTTPProxy(c.config.proxy.addr, c.config.proxy.auth))
+		}
+	}
+
+	c.dnsClient = godns.New(opts...)
 }
 
 // NewDefault 创建默认配置的CDN检测器
@@ -102,52 +188,6 @@ func NewDefault() *CDNChecker {
 
 // Option 配置选项
 type Option func(*CDNChecker)
-
-// WithDNSServers 设置DNS服务器
-func WithDNSServers(servers ...string) Option {
-	return func(c *CDNChecker) {
-		c.dnsClient = godns.New(
-			godns.WithServers(servers...),
-			godns.WithTimeout(5*time.Second),
-			godns.WithRetries(2),
-		)
-	}
-}
-
-// WithDoH 启用DNS over HTTPS
-func WithDoH() Option {
-	return func(c *CDNChecker) {
-		c.dnsClient = godns.New(
-			godns.WithProtocol(godns.DoH),
-			godns.WithTimeout(10*time.Second),
-			godns.WithRetries(2),
-		)
-	}
-}
-
-// WithSOCKS5Proxy 设置SOCKS5代理
-func WithSOCKS5Proxy(addr string, auth *godns.ProxyAuth) Option {
-	return func(c *CDNChecker) {
-		c.dnsClient = godns.New(
-			godns.WithSOCKS5Proxy(addr, auth),
-			godns.WithTimeout(10*time.Second),
-			godns.WithRetries(2),
-		)
-	}
-}
-
-// WithHTTPProxy 设置HTTP代理（仅支持DoT协议）
-func WithHTTPProxy(proxyURL string, auth *godns.ProxyAuth) Option {
-	return func(c *CDNChecker) {
-		// HTTP代理模式下强制使用DoT协议
-		c.dnsClient = godns.New(
-			godns.WithProtocol(godns.DoH),       // 强制使用DoT
-			godns.WithHTTPProxy(proxyURL, auth), // 添加auth参数
-			godns.WithTimeout(15*time.Second),   // HTTP代理可能需要更长超时
-			godns.WithRetries(2),
-		)
-	}
-}
 
 // initCIDRCache 初始化CIDR缓存
 func (c *CDNChecker) initCIDRCache() {
