@@ -7,7 +7,7 @@
 - 🚀 **高性能**: 基于godns的并发DNS查询
 - 🌐 **IPv6支持**: 同时检测IPv4和IPv6地址
 - 🔍 **多重验证**: IP段匹配、多IP检测、地理分布分析
-- 📡 **多协议支持**: UDP、DoH、SOCKS5代理
+- 📡 **多协议支持**: UDP、DoH、DoT、SOCKS5/HTTP代理
 - 🎯 **准确检测**: 内置主流CDN服务商IP段
 - 💡 **简洁设计**: 遵循"less is more"原则
 
@@ -76,6 +76,20 @@ checker := cdncheck.New(
 checker := cdncheck.New(
     cdncheck.WithSOCKS5Proxy("127.0.0.1:1080", nil),
 )
+
+// 使用HTTP代理（强制DoH协议）
+checker := cdncheck.New(
+    cdncheck.WithHTTPProxy("127.0.0.1:8080", nil),
+)
+
+// 使用带认证的HTTP代理
+auth := &godns.ProxyAuth{
+    Username: "user",
+    Password: "pass",
+}
+checker := cdncheck.New(
+    cdncheck.WithHTTPProxy("127.0.0.1:8080", auth),
+)
 ```
 
 ### IP检测
@@ -138,6 +152,7 @@ type CheckResult struct {
 - `WithDNSServers(servers ...string)`: 设置DNS服务器
 - `WithDoH()`: 启用DNS over HTTPS
 - `WithSOCKS5Proxy(addr string, auth *godns.ProxyAuth)`: 设置SOCKS5代理
+- `WithHTTPProxy(proxyURL string, auth *godns.ProxyAuth)`: 设置HTTP代理（强制使用DoT协议）
 
 ## 检测策略
 

@@ -136,6 +136,19 @@ func WithSOCKS5Proxy(addr string, auth *godns.ProxyAuth) Option {
 	}
 }
 
+// WithHTTPProxy 设置HTTP代理（仅支持DoT协议）
+func WithHTTPProxy(proxyURL string, auth *godns.ProxyAuth) Option {
+	return func(c *CDNChecker) {
+		// HTTP代理模式下强制使用DoT协议
+		c.dnsClient = godns.New(
+			godns.WithProtocol(godns.DoH),       // 强制使用DoT
+			godns.WithHTTPProxy(proxyURL, auth), // 添加auth参数
+			godns.WithTimeout(15*time.Second),   // HTTP代理可能需要更长超时
+			godns.WithRetries(2),
+		)
+	}
+}
+
 // initCIDRCache 初始化CIDR缓存
 func (c *CDNChecker) initCIDRCache() {
 	c.cacheOnce.Do(func() {
