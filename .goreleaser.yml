@@ -1,0 +1,31 @@
+version: 2
+
+before:
+  hooks:
+    - go mod download
+    - go mod verify
+
+builds:
+  - main: example/main.go
+    binary: example
+    id: example
+    env:
+      - CGO_ENABLED=0
+    goos: [windows, linux, darwin]
+    goarch: [amd64, arm64]
+
+    flags:
+      - -trimpath
+      - -pgo=auto
+    ldflags:
+      - -s
+      - -w
+
+# 修复废弃的配置项
+archives:
+  - formats: [zip] # 替换 format: zip
+    ids: [example] # 替换 builds: [pyxis]
+    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ if eq .Os "darwin" }}macOS{{ else }}{{ .Os }}{{ end }}_{{ .Arch }}'
+
+checksum:
+  algorithm: sha256
